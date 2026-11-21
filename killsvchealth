@@ -1,0 +1,127 @@
+Content is user-generated and unverified.
+Learn about artifacts
+#!/bin/sh
+# kill-svc-health.sh - find and remove the Red Team "svc_health" backdoor.
+# Works on Ubuntu/Debian/Mint, Rocky/Fedora, Alpine (POSIX sh, BusyBox OK).
+#
+#   sh kill-svc-health.sh          REPORT ONLY - changes nothing
+#   sh kill-svc-health.sh --fix    back up every file, then remove the backdoor
+#
+# What it removes (only with --fix):
+#   - lines mentioning svc_health / its password in shell startup files and crontabs
+#     (root + /home users, /etc/profile*, bash.bashrc, /etc/bashrc, cron, Alpine crontabs)
+#   - systemd units / OpenRC scripts / local.d scripts / /usr/local scripts that mention it
+#   - /etc/sudoers.d/svc_health and svc_health lines in doas config
+#   - the svc_health account and its home folder
+# It does NOT touch SSH config, firewall, passwords, or the main /etc/sudoers (reports only).
+# Backups + report: /root/ir/svc_health-<timestamp>/
+
+PAT='svc_health|SMBlyRequ1r3d'
+MODE="$1"
+[ "$(id -u)" = 0 ] || { echo "Run as root."; exit 1; }
+TS=$(date +%Y%m%d-%H%M%S)
+BK="/root/ir/svc_health-$TS"
+mkdir -p "$BK"
+LOG="$BK/report.txt"
+say() { echo "$*" | tee -a "$LOG"; }
+fix() { [ "$MODE" = "--fix" ]; }
+backup() { mkdir -p "$BK$(dirname "$1")"; cp -a "$1" "$BK$1"; }
+
+say "===== $(hostname) $(date) mode=${MODE:-report-only} ====="
+say "Backups/report: $BK"
+
+say ""; say "-- 1. Account"
+if id svc_health >/dev/null 2>&1; then say "!! svc_health EXISTS: $(id svc_health)"; else say "svc_health does not exist"; fi
+
+say ""; say "-- 2. Files that mention it"
+FILES=$(grep -rlE "$PAT" \
+  /root/.bashrc /root/.profile /root/.bash_profile /root/.bash_login /root/.bash_logout /root/.ashrc \
+  /home/*/.bashrc /home/*/.profile /home/*/.bash_profile /home/*/.bash_login /home/*/.bash_logout \
+  /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc /etc/bash.bash_logout /etc/environment \
+  /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/crontabs /var/spool/cron \
+  /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system \
+  /etc/init.d /etc/local.d /etc/rc.local /usr/local/bin /usr/local/sbin 2>/dev/null \
+  | grep -v '^/root/ir/' | grep -v '^/home/svc_health/' | sort -u)
+[ -z "$FILES" ] && say "(none found by name - if the account keeps coming back, see step 6)"
+RELOAD_SYSTEMD=0; RELOAD_CRON=0
+for f in $FILES; do
+  say "!! $f"
+  grep -nE "$PAT" "$f" 2>/dev/null | cut -c1-200 | sed 's/^/     /' | tee -a "$LOG"
+  fix || continue
+  backup "$f"
+  case "$f" in
+    */systemd/system/*)
+      u=$(basename "$f")
+      systemctl disable --now "$u" >/dev/null 2>&1
+      mv "$f" "$BK$f.removed"; RELOAD_SYSTEMD=1
+      say "   -> disabled + moved unit $u" ;;
+    /etc/init.d/*)
+      s=$(basename "$f")
+      rc-service "$s" stop >/dev/null 2>&1; rc-update del "$s" >/dev/null 2>&1
+      mv "$f" "$BK$f.removed"; say "   -> stopped + moved OpenRC script $s" ;;
+    /etc/local.d/*|/usr/local/bin/*|/usr/local/sbin/*)
+      mv "$f" "$BK$f.removed"; chmod 000 "$BK$f.removed"; say "   -> moved planted script" ;;
+    /etc/crontab|/etc/cron.d/*|/etc/crontabs/*|/var/spool/cron/*)
+      sed -i -E "/$PAT/d" "$f"; RELOAD_CRON=1; say "   -> removed matching cron lines" ;;
+    *)
+      sed -i -E "/$PAT/d" "$f"; say "   -> removed matching lines" ;;
+  esac
+done
+if fix; then
+  [ $RELOAD_SYSTEMD = 1 ] && systemctl daemon-reload 2>/dev/null
+  if [ $RELOAD_CRON = 1 ]; then
+    systemctl try-restart cron crond 2>/dev/null
+    command -v rc-service >/dev/null && rc-service crond restart >/dev/null 2>&1
+  fi
+fi
+
+say ""; say "-- 3. Sudo / doas rules"
+for f in /etc/sudoers.d/* /etc/doas.conf /etc/doas.d/*; do
+  [ -f "$f" ] || continue
+  grep -qE "$PAT" "$f" || continue
+  say "!! $f"; grep -nE "$PAT" "$f" | sed 's/^/     /' | tee -a "$LOG"
+  fix || continue
+  backup "$f"
+  case "$f" in
+    /etc/sudoers.d/*) mv "$f" "$BK$f.removed"; say "   -> removed sudoers file" ;;
+    *) sed -i -E "/$PAT/d" "$f"; say "   -> removed matching doas lines" ;;
+  esac
+done
+if grep -qE "$PAT" /etc/sudoers 2>/dev/null; then
+  say "!! /etc/sudoers itself mentions svc_health - remove it BY HAND with: visudo"
+fi
+command -v visudo >/dev/null && fix && { visudo -c 2>&1 | tee -a "$LOG"; }
+
+say ""; say "-- 4. Account removal"
+if id svc_health >/dev/null 2>&1; then
+  if fix; then
+    grep '^svc_health:' /etc/passwd > "$BK/passwd-line.txt" 2>/dev/null
+    pkill -KILL -u svc_health 2>/dev/null; sleep 1
+    if command -v userdel >/dev/null; then userdel -r svc_health 2>&1 | tee -a "$LOG"
+    else deluser --remove-home svc_health 2>&1 | tee -a "$LOG"; fi
+  else say "(would delete svc_health and its home folder)"; fi
+fi
+
+say ""; say "-- 5. Related backdoors seen on our boxes (REPORT ONLY - fix by hand)"
+grep -hEi '^\s*AuthorizedKeysFile' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/* 2>/dev/null | grep -E '/etc/|/tmp/|/var/' \
+  && say "!! AuthorizedKeysFile points at an extra system path (see above) - planted key file"
+[ -d /etc/ssh/.ssh ] && say "!! /etc/ssh/.ssh exists - planted key folder: $(ls /etc/ssh/.ssh 2>/dev/null | tr '\n' ' ')"
+grep -HnE 'kali@kali|deploy@management|root@localhost' /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys /etc/ssh/.ssh/authorized_keys 2>/dev/null \
+  | cut -c1-160 | sed 's/^/!! key: /' | tee -a "$LOG"
+
+if fix; then
+  say ""; say "-- 6. Verify: simulate a root login, then check the account stays gone"
+  if command -v bash >/dev/null; then bash -lic 'exit' </dev/null >/dev/null 2>&1; else sh -lc 'exit' </dev/null >/dev/null 2>&1; fi
+  sleep 3
+  if id svc_health >/dev/null 2>&1; then
+    say "!! STILL RE-CREATED - a hidden hook remains. Deleting again; find it with:"
+    say "   bash -lix -c true 2>&1 | grep -nE -B3 'useradd|svc_health'"
+    pkill -KILL -u svc_health 2>/dev/null
+    if command -v userdel >/dev/null; then userdel -r svc_health 2>/dev/null; else deluser --remove-home svc_health 2>/dev/null; fi
+    rm -f /etc/sudoers.d/svc_health
+  else
+    say "OK: svc_health stayed gone after a simulated login."
+  fi
+  say "Final test: open a NEW SSH session and run:  id svc_health"
+fi
+say ""; say "Report saved: $LOG"
